@@ -18,10 +18,12 @@ package apikey
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/crossplane/crossplane-runtime/pkg/event"
 	"github.com/crossplane/crossplane-runtime/pkg/logging"
+	"github.com/crossplane/crossplane-runtime/pkg/meta"
 	"github.com/crossplane/crossplane-runtime/pkg/ratelimiter"
 	"github.com/crossplane/crossplane-runtime/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/pkg/resource"
@@ -163,6 +165,12 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 		return managed.ExternalObservation{}, errors.New(errNotMyType)
 	}
 
+	// import
+	crCopy := cr.DeepCopy()
+	if meta.GetExternalName(cr) != "" {
+		crCopy.Name = meta.GetExternalName(cr)
+	}
+
 	// Confluent
 	var client = c.service.(apikey.IClient)
 	ccsa, err := client.GetApiKeyByKey(cr.Status.AtProvider.Key)
@@ -179,6 +187,14 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 				ConnectionDetails: managed.ConnectionDetails{},
 			}, err
 		}
+	}
+
+	if cr.Status.AtProvider.Key == "" {
+		return managed.ExternalObservation{
+			ResourceExists:    false,
+			ResourceUpToDate:  false,
+			ConnectionDetails: managed.ConnectionDetails{},
+		}, nil
 	}
 
 	// Diff
@@ -204,6 +220,7 @@ func (c *external) Observe(ctx context.Context, mg resource.Managed) (managed.Ex
 
 func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.ExternalCreation, error) {
 	cr, ok := mg.(*v1alpha1.ApiKey)
+
 	if !ok {
 		return managed.ExternalCreation{}, errors.New(errNotMyType)
 	}
@@ -213,22 +230,46 @@ func (c *external) Create(ctx context.Context, mg resource.Managed) (managed.Ext
 		return managed.ExternalCreation{}, err
 	}
 
+	crCopy := cr.DeepCopy()
+	resourceNew := true
 	var client = c.service.(apikey.IClient)
-	out, err := client.ApiKeyCreate(cr.Spec.ForProvider.Resource, cr.Spec.ForProvider.Description, cr.Spec.ForProvider.ServiceAccount, cr.Spec.ForProvider.Environment)
 
-	if err != nil {
-		return managed.ExternalCreation{}, err
+	if meta.GetExternalName(cr) != "" {
+		crCopy.Status.AtProvider.Key = meta.GetExternalName(cr) // use a meningful field
+		_, err := client.GetApiKeyByKey(crCopy.Status.AtProvider.Key)
+		if err != nil {
+			if err.Error() == apikey.ErrNotExists {
+				// returning nil because we want create on not found
+
+			} else {
+				return managed.ExternalCreation{}, err
+			}
+		} else {
+			resourceNew = false
+		}
 	}
 
-	cr.Status.AtProvider.Key = out.Key
+	fmt.Println("CREATE is resource new:", resourceNew)
+	if resourceNew {
+		out, err := client.ApiKeyCreate(cr.Spec.ForProvider.Resource, cr.Spec.ForProvider.Description, cr.Spec.ForProvider.ServiceAccount, cr.Spec.ForProvider.Environment)
+		if err != nil {
+			return managed.ExternalCreation{}, err
+		}
+		cr.Status.AtProvider.Key = out.Key
+
+	}
+
+	meta.SetExternalName(cr, crCopy.Status.AtProvider.Key)
 	if err := c.kube.Status().Update(ctx, cr); err != nil {
 		return managed.ExternalCreation{}, err
 	}
 
+	if resourceNew {
 	conn := managed.ConnectionDetails{
 		xpv1.ResourceCredentialsSecretUserKey:     []byte(out.Key),
 		xpv1.ResourceCredentialsSecretPasswordKey: []byte(out.Secret),
 	}
+	
 
 	return managed.ExternalCreation{
 		// Optionally return any details that may be required to connect to the
